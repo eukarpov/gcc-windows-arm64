@@ -25,6 +25,8 @@
 #include <syncstream>
 #include <mutex>
 #include <bits/functional_hash.h>
+// It has been added to resolve a compilation issue on aarch64-pc-cygwin
+#include <bits/std_mutex.h>
 
 #if _GLIBCXX_HAS_GTHREADS
 namespace std _GLIBCXX_VISIBILITY(default)
