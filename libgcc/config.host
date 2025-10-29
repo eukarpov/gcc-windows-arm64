@@ -463,7 +463,13 @@ aarch64-*-mingw*)
 	    tmake_thr_file="mingw/t-mingw-mcfgthread"
 	    ;;
 	esac
-	tmake_file="${tmake_file} ${cpu_type}/t-no-eh ${tmake_thr_file}"
+	# This has to match the logic for DWARF2_UNWIND_INFO in gcc/config/i386/cygming.h
+	if test x$ac_cv_sjlj_exceptions = xyes; then
+		tmake_eh_file="i386/t-sjlj-eh"
+	else
+		tmake_eh_file="i386/t-seh-eh"
+	fi
+	tmake_file="${tmake_file} ${tmake_eh_file} ${tmake_thr_file}"
 	tmake_file="${tmake_file} t-dfprules"
 	tmake_file="${tmake_file} ${cpu_type}/t-aarch64"
 	tmake_file="${tmake_file} ${cpu_type}/t-mingw"
