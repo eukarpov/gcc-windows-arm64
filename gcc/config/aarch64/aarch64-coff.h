@@ -31,8 +31,15 @@
 #undef PTRDIFF_TYPE
 #define PTRDIFF_TYPE	"long long int"
 
+/* For Coff, the size of long double is 64 bits.
+   Reference:
+   https://learn.microsoft.com/en-us/cpp/c-language/type-long-double.  */
+#define TARGET_LONG_DOUBLE_64 1
+
 #undef LONG_TYPE_SIZE
 #define LONG_TYPE_SIZE 32
+
+#define __NO_BINARY80__
 
 #ifndef ASM_GENERATE_INTERNAL_LABEL
 # define ASM_GENERATE_INTERNAL_LABEL(STRING, PREFIX, NUM)  \
