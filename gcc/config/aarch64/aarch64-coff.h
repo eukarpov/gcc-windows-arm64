@@ -61,10 +61,17 @@
 #define ASM_OUTPUT_SKIP(STREAM, NBYTES) 	\
   fprintf (STREAM, "\t.space\t%d  // skip\n", (int) (NBYTES))
 
-/* Definitions that are not yet supported by binutils for the
+#define ASM_COMMENT_START "//"
+
+/* ASM_OUTPUT_TYPE_DIRECTIVE is not yet supported by binutils for the
    aarch64-w64-mingw32 target.  */
 #define ASM_OUTPUT_TYPE_DIRECTIVE(STREAM, NAME, TYPE)
-#define ASM_DECLARE_FUNCTION_SIZE(FILE, FNAME, DECL)
+
+/* Structured Exception Handling (SEH) is not yet supported by binutils
+   so adding seh_endproc as an assembly comment to mark the end of a
+   function.  */
+#define ASM_DECLARE_FUNCTION_SIZE(FILE, FNAME, DECL) \
+  fprintf (FILE, "\t" ASM_COMMENT_START "  seh_endproc\n")
 
 #define TEXT_SECTION_ASM_OP	"\t.text"
 #define DATA_SECTION_ASM_OP	"\t.data"

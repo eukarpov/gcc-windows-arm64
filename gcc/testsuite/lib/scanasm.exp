@@ -4,12 +4,12 @@
 # it under the terms of the GNU General Public License as published by
 # the Free Software Foundation; either version 3 of the License, or
 # (at your option) any later version.
-# 
+#
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU General Public License for more details.
-# 
+#
 # You should have received a copy of the GNU General Public License
 # along with GCC; see the file COPYING3.  If not see
 # <http://www.gnu.org/licenses/>.
@@ -138,7 +138,7 @@ proc scan-assembler-not { args } {
 
 set_required_options_for scan-assembler-not
 
-# Return the scan for the assembly for hidden visibility. 
+# Return the scan for the assembly for hidden visibility.
 
 proc hidden-scan-for { symbol } {
 
@@ -516,7 +516,7 @@ proc scan-assembler-times { args } {
 
 set_required_options_for scan-assembler-times
 
-# Call pass if pattern is present within a lower or upper bound, 
+# Call pass if pattern is present within a lower or upper bound,
 # otherwise fail.
 # ex /* { dg-final { scan-assembler-bound {RE} > 3 } }
 proc scan-assembler-bound { args } {
@@ -563,7 +563,7 @@ proc scan-assembler-bound { args } {
         error "scan-assembler-bound: illegal argument: $bound"
         return
     }
-    
+
     set fd [open $output_file r]
     set text [read $fd]
     close $fd
@@ -885,6 +885,8 @@ proc configure_check-function-bodies { config } {
 	set up_config(end) {^\}$}
     } elseif { [istarget *-*-darwin*] } {
 	set up_config(end) {^LFE[0-9]+}
+    } elseif { [istarget aarch64*-*-mingw32] } {
+	set up_config(end) {seh_endproc}
     } else {
 	set up_config(end) {^\s*\.size}
     }
