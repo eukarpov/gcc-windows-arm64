@@ -114,6 +114,11 @@
 #define HAVE_AS_AEABI_BUILD_ATTRIBUTES 0
 #endif
 
+/* Not on Windows ABI unless explicitly set.  */
+#ifndef TARGET_AARCH64_MS_ABI
+#define TARGET_AARCH64_MS_ABI 0
+#endif
+
 /* Flags that describe how a function shares certain architectural state
    with its callers.
 
@@ -749,8 +754,9 @@ handle_aarch64_vector_pcs_attribute (tree *node, tree name, tree,
       *no_add_attrs = true;
       return NULL_TREE;
 
-      /* Rely on the exclusions list for preserve_none.  */
+    /* Rely on the exclusions list for preserve_none.  */
     case ARM_PCS_PRESERVE_NONE:
+    case ARM_PCS_MS_VARIADIC:
     case ARM_PCS_TLSDESC:
     case ARM_PCS_UNKNOWN:
       break;
@@ -2336,11 +2342,55 @@ aarch64_takes_arguments_in_sve_regs_p (const_tree fntype)
   return false;
 }
 
+/* Returns true if a function has variadic arguments.
+   Only works for Windows ABI.  */
+
+static bool
+aarch64_ms_is_variadic_function_type (const_tree fntype)
+{
+  if (!TARGET_AARCH64_MS_ABI)
+    return false;
+
+  if (TYPE_NO_NAMED_ARGS_STDARG_P (fntype))
+    return true;
+
+  auto arg_count = 0;
+  for (tree arg = TYPE_ARG_TYPES (fntype); arg; arg = TREE_CHAIN (arg))
+    {
+      if (TREE_VALUE (arg) == void_type_node)
+	return false;
+      arg_count++;
+    }
+
+  return arg_count > 0;
+}
+
+/* Return the descriptor of the Windows Arm64 variadic function call ABI.  */
+
+static const predefined_function_abi &
+aarch64_ms_variadic_abi (void)
+{
+  predefined_function_abi &ms_variadic_abi = function_abis[ARM_PCS_MS_VARIADIC];
+  if (!ms_variadic_abi.initialized_p ())
+    {
+      HARD_REG_SET full_reg_clobbers
+	      = default_function_abi.full_reg_clobbers ();
+      ms_variadic_abi.initialize (ARM_PCS_MS_VARIADIC, full_reg_clobbers);
+    }
+  return ms_variadic_abi;
+}
+
 /* Implement TARGET_FNTYPE_ABI.  */
 
 static const predefined_function_abi &
 aarch64_fntype_abi (const_tree fntype)
 {
+  if (aarch64_ms_is_variadic_function_type (fntype))
+    return aarch64_ms_variadic_abi ();
+
+  if (lookup_attribute ("ms_abi", TYPE_ATTRIBUTES (fntype)))
+    return aarch64_ms_variadic_abi ();
+
   if (lookup_attribute ("aarch64_vector_pcs", TYPE_ATTRIBUTES (fntype)))
     return aarch64_simd_abi ();
 
@@ -2561,6 +2611,10 @@ aarch64_reg_save_mode (unsigned int regno)
       case ARM_PCS_AAPCS64:
 	/* Only the low 64 bits are saved by the base PCS.  */
 	return DFmode;
+
+      case ARM_PCS_MS_VARIADIC:
+	/* Windows only uses GP registers for variadic arguments.  */
+	return DImode;
 
       case ARM_PCS_SIMD:
 	/* The vector PCS saves the low 128 bits (which is the full
@@ -7345,6 +7399,7 @@ num_pcs_arg_regs (enum arm_pcs pcs)
     case ARM_PCS_SIMD:
     case ARM_PCS_SVE:
     case ARM_PCS_TLSDESC:
+    case ARM_PCS_MS_VARIADIC:
     case ARM_PCS_UNKNOWN:
       return NUM_ARG_REGS;
     }
@@ -7369,10 +7424,85 @@ get_pcs_arg_reg (enum arm_pcs pcs, int num)
     case ARM_PCS_SIMD:
     case ARM_PCS_SVE:
     case ARM_PCS_TLSDESC:
+    case ARM_PCS_MS_VARIADIC:
     case ARM_PCS_UNKNOWN:
       return R0_REGNUM + num;
     }
   gcc_unreachable ();
+}
+
+static int
+aarch64_arg_size (const function_arg_info &arg)
+{
+  HOST_WIDE_INT size;
+
+  /* Size in bytes, rounded to the nearest multiple of 8 bytes.  */
+  if (arg.type)
+    size = int_size_in_bytes (arg.type);
+  else
+    /* No frontends can create types with variable-sized modes, so we
+       shouldn't be asked to pass or return them.  */
+    size = GET_MODE_SIZE (arg.mode).to_constant ();
+
+  return ROUND_UP (size, UNITS_PER_WORD);
+}
+
+/* Layout a function argument according to the AAPCS64 rules.  The rule
+   numbers refer to the rule numbers in the AAPCS64.
+
+   The Windows Arm64 variadic function call ABI uses only C.12-C15 rules.
+   See: https://learn.microsoft.com/en-us/cpp/build/arm64-windows-abi-conventions#addendum-variadic-functions.  */
+
+static void
+aarch64_ms_variadic_abi_layout_arg (cumulative_args_t pcum_v,
+				    const function_arg_info &arg)
+{
+  CUMULATIVE_ARGS *pcum = get_cumulative_args (pcum_v);
+  auto mode = arg.mode;
+  auto ncrn = pcum->aapcs_ncrn;
+  HOST_WIDE_INT size = aarch64_arg_size (arg);
+  auto nregs = size / UNITS_PER_WORD;
+
+  if (ncrn < NUM_ARG_REGS)
+    {
+      /* The argument bytes are copied to the core registers.  */
+      if (nregs == 1 || GET_MODE_CLASS (mode) == MODE_INT)
+	pcum->aapcs_reg = gen_rtx_REG (mode, R0_REGNUM + ncrn);
+      else
+	{
+	  /* Handle the case when argument is split
+	     between the last registers and the
+	     stack.  */
+	  if (ncrn + nregs > NUM_ARG_REGS)
+	    {
+	      pcum->aapcs_stack_words = ncrn + nregs - NUM_ARG_REGS;
+	      nregs -= pcum->aapcs_stack_words;
+	    }
+
+	  /* Generate load arg to registers instructions.  */
+	  rtx par = gen_rtx_PARALLEL (mode, rtvec_alloc (nregs));
+	  for (auto i = 0; i < nregs; i++)
+	    {
+	      rtx tmp = gen_rtx_REG (word_mode, R0_REGNUM + ncrn + i);
+	      tmp = gen_rtx_EXPR_LIST (VOIDmode, tmp,
+				       GEN_INT (i * UNITS_PER_WORD));
+	      XVECEXP (par, 0, i) = tmp;
+	    }
+	  pcum->aapcs_reg = par;
+	}
+
+      pcum->aapcs_nextncrn = ncrn + nregs;
+    }
+  else
+    {
+      /* The remaining arguments are passed on stack; record the needed
+	 number of words for this argument and align the total size if
+	 necessary.  */
+      pcum->aapcs_nextncrn = NUM_ARG_REGS;
+      pcum->aapcs_stack_words = nregs;
+    }
+
+  pcum->aapcs_arg_processed = true;
 }
 
 /* Layout a function argument according to the AAPCS64 rules.  The rule
@@ -7397,6 +7527,12 @@ aarch64_layout_arg (cumulative_args_t pcum_v, const function_arg_info &arg)
   /* We need to do this once per argument.  */
   if (pcum->aapcs_arg_processed)
     return;
+
+  if (pcum->pcs_variant == ARM_PCS_MS_VARIADIC)
+    {
+      aarch64_ms_variadic_abi_layout_arg (pcum_v, arg);
+      return;
+    }
 
   bool warn_pcs_change
     = (warn_psabi
@@ -7515,15 +7651,7 @@ aarch64_layout_arg (cumulative_args_t pcum_v, const function_arg_info &arg)
 		&& (aarch64_some_values_include_pst_objects_p (type)
 		    || (vec_flags & VEC_PARTIAL)));
 
-  /* Size in bytes, rounded to the nearest multiple of 8 bytes.  */
-  if (type)
-    size = int_size_in_bytes (type);
-  else
-    /* No frontends can create types with variable-sized modes, so we
-       shouldn't be asked to pass or return them.  */
-    size = GET_MODE_SIZE (mode).to_constant ();
-  size = ROUND_UP (size, UNITS_PER_WORD);
-
+  size = aarch64_arg_size (arg);
   allocate_ncrn = (type) ? !(FLOAT_TYPE_P (type)) : !FLOAT_MODE_P (mode);
   allocate_nvrn = aarch64_vfp_is_call_candidate (pcum_v,
 						 mode,
@@ -7758,6 +7886,27 @@ aarch64_finish_sme_mode_switch_args (CUMULATIVE_ARGS *pcum)
   return gen_rtx_PARALLEL (VOIDmode, argvec);
 }
 
+/* Implement TARGET_ARG_PARTIAL_BYTES.  */
+
+#if TARGET_AARCH64_MS_ABI == 1
+static int
+aarch64_arg_partial_bytes (cumulative_args_t pcum_v,
+				const function_arg_info &arg ATTRIBUTE_UNUSED)
+{
+  CUMULATIVE_ARGS *pcum = get_cumulative_args (pcum_v);
+
+  if (pcum->pcs_variant != ARM_PCS_MS_VARIADIC)
+    return 0;
+
+  /* Handle the case when argument is split between the last registers and
+     the stack.  */
+  if ((pcum->aapcs_reg != NULL_RTX) && (pcum->aapcs_stack_words != 0))
+    return pcum->aapcs_stack_words * UNITS_PER_WORD;
+
+  return 0;
+}
+#endif
+
 /* Implement TARGET_FUNCTION_ARG.  */
 
 static rtx
@@ -7767,7 +7916,8 @@ aarch64_function_arg (cumulative_args_t pcum_v, const function_arg_info &arg)
   gcc_assert (pcum->pcs_variant == ARM_PCS_AAPCS64
 	      || pcum->pcs_variant == ARM_PCS_SIMD
 	      || pcum->pcs_variant == ARM_PCS_SVE
-	      || pcum->pcs_variant == ARM_PCS_PRESERVE_NONE);
+	      || pcum->pcs_variant == ARM_PCS_PRESERVE_NONE
+	      || pcum->pcs_variant == ARM_PCS_MS_VARIADIC);
 
   if (arg.end_marker_p ())
     {
@@ -7860,11 +8010,13 @@ aarch64_function_arg_advance (cumulative_args_t pcum_v,
   if (pcum->pcs_variant == ARM_PCS_AAPCS64
       || pcum->pcs_variant == ARM_PCS_SIMD
       || pcum->pcs_variant == ARM_PCS_SVE
-      || pcum->pcs_variant == ARM_PCS_PRESERVE_NONE)
+      || pcum->pcs_variant == ARM_PCS_PRESERVE_NONE
+      || pcum->pcs_variant == ARM_PCS_MS_VARIADIC)
     {
       aarch64_layout_arg (pcum_v, arg);
-      gcc_assert ((pcum->aapcs_reg != NULL_RTX)
-		  != (pcum->aapcs_stack_words != 0));
+      gcc_assert ((pcum->pcs_variant == ARM_PCS_MS_VARIADIC)
+		   || (pcum->aapcs_reg != NULL_RTX)
+		       != (pcum->aapcs_stack_words != 0));
       if (pcum->aapcs_reg
 	  && aarch64_call_switches_pstate_sm (pcum->isa_mode))
 	aarch64_record_sme_mode_switch_args (pcum);
@@ -7905,6 +8057,7 @@ aarch64_function_arg_regno_p (unsigned regno)
     case ARM_PCS_SIMD:
     case ARM_PCS_SVE:
     case ARM_PCS_TLSDESC:
+    case ARM_PCS_MS_VARIADIC:
     case ARM_PCS_UNKNOWN:
       return ((GP_REGNUM_P (regno) && regno < R0_REGNUM + NUM_ARG_REGS)
 	      || (FP_REGNUM_P (regno) && regno < V0_REGNUM + NUM_FP_ARG_REGS)
@@ -21818,6 +21971,7 @@ static GTY(()) tree va_list_type;
      int   __vr_offs;
    };  */
 
+#if TARGET_AARCH64_MS_ABI == 0
 static tree
 aarch64_build_builtin_va_list (void)
 {
@@ -21883,8 +22037,33 @@ aarch64_build_builtin_va_list (void)
 
   return va_list_type;
 }
+#endif
+
+/* Windows Arm64 variadic function call ABI specific va_list type node.  */
+tree ms_va_list_type_node;
+
+/* Implement TARGET_BUILD_BUILTIN_VA_LIST.
+
+   Setup the builtin va_list data type and for 64-bit the additional
+   calling convention specific va_list data types.  */
+
+#if TARGET_AARCH64_MS_ABI == 1
+static tree
+aarch64_ms_variadic_abi_build_builtin_va_list (void)
+{
+  /* For MS_ABI we use plain pointer to argument area.  */
+  tree char_ptr_type = build_pointer_type (char_type_node);
+  tree attr = tree_cons (get_identifier ("ms_abi va_list"), NULL_TREE,
+			 TYPE_ATTRIBUTES (char_ptr_type));
+  ms_va_list_type_node = build_type_attribute_variant (char_ptr_type, attr);
+
+  return ms_va_list_type_node;
+}
+#endif
 
 /* Implement TARGET_EXPAND_BUILTIN_VA_START.  */
+
+#if TARGET_AARCH64_MS_ABI == 0
 static void
 aarch64_expand_builtin_va_start (tree valist, rtx nextarg ATTRIBUTE_UNUSED)
 {
@@ -21967,9 +22146,88 @@ aarch64_expand_builtin_va_start (tree valist, rtx nextarg ATTRIBUTE_UNUSED)
 	      build_int_cst (TREE_TYPE (vroff), -vr_save_area_size));
   expand_expr (t, const0_rtx, VOIDmode, EXPAND_NORMAL);
 }
+#endif
+
+/* Implement TARGET_EXPAND_BUILTIN_VA_START.  */
+
+#if TARGET_AARCH64_MS_ABI == 1
+static void
+aarch64_ms_variadic_abi_expand_builtin_va_start (tree valist, rtx nextarg)
+{
+  rtx va_r = expand_expr (valist, NULL_RTX, VOIDmode, EXPAND_WRITE);
+
+  /* ??? Should we initialize and use cfun->va_list_gpr_size instead of
+   * defining single purpose
+   * cfun->machine->frame.unaligned_saved_varargs_size field.
+   * Currently, the cfun->va_list_gpr_size contains only value 255.  */
+  int offset = cfun->machine->frame.unaligned_saved_varargs_size;
+  nextarg = plus_constant (GET_MODE (nextarg), nextarg, -offset);
+
+  convert_move (va_r, nextarg, 0);
+}
+#endif
+
+/* Iterate through the target-specific builtin types for va_list.
+   IDX denotes the iterator, *PTREE is set to the result type of
+   the va_list builtin, and *PNAME to its internal type.
+   Returns zero if there is no element for this index, otherwise
+   IDX should be increased upon the next call.
+   Note, do not iterate a base builtin's name like __builtin_va_list.
+   Used from c_common_nodes_and_builtins.  */
+
+#if TARGET_AARCH64_MS_ABI == 1
+static int
+aarch64_ms_variadic_abi_enum_va_list (int idx, const char **pname, tree *ptree)
+{
+  switch (idx)
+    {
+    default:
+      break;
+
+    case 0:
+      *ptree = ms_va_list_type_node;
+      *pname = "__builtin_ms_va_list";
+      return 1;
+    }
+
+  return 0;
+}
+#endif
+
+/* This function returns the calling abi specific va_list type node.
+   It returns  the FNDECL specific va_list type.  */
+
+#if TARGET_AARCH64_MS_ABI == 1
+static tree
+aarch64_ms_variadic_abi_fn_abi_va_list (tree fndecl)
+{
+  gcc_assert (fndecl != NULL_TREE);
+
+  arm_pcs pcs = (arm_pcs) fndecl_abi (fndecl).id ();
+  if (pcs == ARM_PCS_MS_VARIADIC)
+    return ms_va_list_type_node;
+
+  return std_fn_abi_va_list (fndecl);
+}
+#endif
+
+/* Returns the canonical va_list type specified by TYPE.
+   If there is no valid TYPE provided, it return NULL_TREE.  */
+
+#if TARGET_AARCH64_MS_ABI == 1
+static tree
+aarch64_ms_variadic_abi_canonical_va_list_type (tree type)
+{
+  if (lookup_attribute ("ms_abi va_list", TYPE_ATTRIBUTES (type)))
+    return ms_va_list_type_node;
+
+  return NULL_TREE;
+}
+#endif
 
 /* Implement TARGET_GIMPLIFY_VA_ARG_EXPR.  */
 
+#if TARGET_AARCH64_MS_ABI == 0
 static tree
 aarch64_gimplify_va_arg_expr (tree valist, tree type, gimple_seq *pre_p,
 			      gimple_seq *post_p ATTRIBUTE_UNUSED)
@@ -22262,6 +22520,7 @@ aarch64_gimplify_va_arg_expr (tree valist, tree type, gimple_seq *pre_p,
 
   return addr;
 }
+#endif
 
 /* Implement TARGET_SETUP_INCOMING_VARARGS.  */
 
@@ -22292,7 +22551,8 @@ aarch64_setup_incoming_varargs (cumulative_args_t cum_v,
     vr_saved = MIN (NUM_FP_ARG_REGS - local_cum.aapcs_nvrn,
 		    cfun->va_list_fpr_size / UNITS_PER_VREG);
 
-  if (!TARGET_FLOAT)
+  /* Windows variadic function calls ABI never uses vector registers.  */
+  if (TARGET_AARCH64_MS_ABI || !TARGET_FLOAT)
     {
       gcc_assert (local_cum.aapcs_nvrn == 0);
       vr_saved = 0;
@@ -22357,8 +22617,9 @@ aarch64_setup_incoming_varargs (cumulative_args_t cum_v,
 
   /* We don't save the size into *PRETEND_SIZE because we want to avoid
      any complication of having crtl->args.pretend_args_size changed.  */
+  cfun->machine->frame.unaligned_saved_varargs_size = gr_saved * UNITS_PER_WORD;
   cfun->machine->frame.saved_varargs_size
-    = (ROUND_UP (gr_saved * UNITS_PER_WORD,
+    = (ROUND_UP (cfun->machine->frame.unaligned_saved_varargs_size,
 		 STACK_BOUNDARY / BITS_PER_UNIT)
        + vr_saved * UNITS_PER_VREG);
 }
@@ -23169,8 +23430,11 @@ static const char *
 aarch64_mangle_type (const_tree type)
 {
   /* The AArch64 ABI documents say that "__va_list" has to be
-     mangled as if it is in the "std" namespace.  */
-  if (lang_hooks.types_compatible_p (CONST_CAST_TREE (type), va_list_type))
+     mangled as if it is in the "std" namespace.
+     The Windows Arm64 ABI uses just an address of the first variadic
+     argument.  */
+  if (!TARGET_AARCH64_MS_ABI
+      && lang_hooks.types_compatible_p (CONST_CAST_TREE (type), va_list_type))
     return "St9__va_list";
 
   /* Half-precision floating point types.  */
@@ -25817,6 +26081,27 @@ aarch64_post_cfi_startproc (FILE *f, tree ignored ATTRIBUTE_UNUSED)
       && aarch64_ra_sign_key == AARCH64_KEY_B)
 	asm_fprintf (f, "\t.cfi_b_key_frame\n");
 }
+
+/* Implement TARGET_STRICT_ARGUMENT_NAMING.
+
+   Return true if the location where a function argument is passed
+   depends on whether or not it is a named argument.
+
+   For Windows ABI of variadic function calls, treat the named arguments as
+   unnamed as they are handled the same way as variadic arguments.  */
+
+#if TARGET_AARCH64_MS_ABI == 1
+static bool
+aarch64_ms_variadic_abi_strict_argument_naming (cumulative_args_t pcum_v)
+{
+  CUMULATIVE_ARGS *pcum = get_cumulative_args (pcum_v);
+
+  if (pcum->pcs_variant == ARM_PCS_MS_VARIADIC)
+    return false;
+
+  return hook_bool_CUMULATIVE_ARGS_true (pcum_v);
+}
+#endif
 
 /* Implements TARGET_ASM_FILE_START.  Output the assembly header.  */
 
@@ -32480,8 +32765,14 @@ aarch64_run_selftests (void)
 #undef TARGET_ASM_PRINT_PATCHABLE_FUNCTION_ENTRY
 #define TARGET_ASM_PRINT_PATCHABLE_FUNCTION_ENTRY aarch64_print_patchable_function_entry
 
+#if TARGET_AARCH64_MS_ABI == 1
+#undef TARGET_BUILD_BUILTIN_VA_LIST
+#define TARGET_BUILD_BUILTIN_VA_LIST \
+  aarch64_ms_variadic_abi_build_builtin_va_list
+#else
 #undef TARGET_BUILD_BUILTIN_VA_LIST
 #define TARGET_BUILD_BUILTIN_VA_LIST aarch64_build_builtin_va_list
+#endif
 
 #undef TARGET_CALLEE_COPIES
 #define TARGET_CALLEE_COPIES hook_bool_CUMULATIVE_ARGS_arg_info_false
@@ -32551,11 +32842,32 @@ aarch64_run_selftests (void)
 #undef  TARGET_EXPAND_BUILTIN
 #define TARGET_EXPAND_BUILTIN aarch64_expand_builtin
 
+#if TARGET_AARCH64_MS_ABI == 1
+#undef TARGET_ENUM_VA_LIST_P
+#define TARGET_ENUM_VA_LIST_P aarch64_ms_variadic_abi_enum_va_list
+
+#undef TARGET_FN_ABI_VA_LIST
+#define TARGET_FN_ABI_VA_LIST aarch64_ms_variadic_abi_fn_abi_va_list
+
+#undef TARGET_CANONICAL_VA_LIST_TYPE
+#define TARGET_CANONICAL_VA_LIST_TYPE \
+  aarch64_ms_variadic_abi_canonical_va_list_type
+
+#undef TARGET_EXPAND_BUILTIN_VA_START
+#define TARGET_EXPAND_BUILTIN_VA_START \
+  aarch64_ms_variadic_abi_expand_builtin_va_start
+#else
 #undef TARGET_EXPAND_BUILTIN_VA_START
 #define TARGET_EXPAND_BUILTIN_VA_START aarch64_expand_builtin_va_start
+#endif
 
 #undef TARGET_FOLD_BUILTIN
 #define TARGET_FOLD_BUILTIN aarch64_fold_builtin
+
+#if TARGET_AARCH64_MS_ABI == 1
+#undef TARGET_ARG_PARTIAL_BYTES
+#define TARGET_ARG_PARTIAL_BYTES aarch64_arg_partial_bytes
+#endif
 
 #undef TARGET_FUNCTION_ARG
 #define TARGET_FUNCTION_ARG aarch64_function_arg
@@ -32592,8 +32904,10 @@ aarch64_run_selftests (void)
 #undef TARGET_GIMPLE_FOLD_BUILTIN
 #define TARGET_GIMPLE_FOLD_BUILTIN aarch64_gimple_fold_builtin
 
+#if TARGET_AARCH64_MS_ABI == 0
 #undef TARGET_GIMPLIFY_VA_ARG_EXPR
 #define TARGET_GIMPLIFY_VA_ARG_EXPR aarch64_gimplify_va_arg_expr
+#endif
 
 #undef  TARGET_INIT_BUILTINS
 #define TARGET_INIT_BUILTINS  aarch64_init_builtins
@@ -33014,8 +33328,14 @@ aarch64_libgcc_floating_mode_supported_p
 #undef TARGET_ASM_POST_CFI_STARTPROC
 #define TARGET_ASM_POST_CFI_STARTPROC aarch64_post_cfi_startproc
 
+#if TARGET_AARCH64_MS_ABI == 1
+#undef TARGET_STRICT_ARGUMENT_NAMING
+#define TARGET_STRICT_ARGUMENT_NAMING \
+  aarch64_ms_variadic_abi_strict_argument_naming
+#else
 #undef TARGET_STRICT_ARGUMENT_NAMING
 #define TARGET_STRICT_ARGUMENT_NAMING hook_bool_CUMULATIVE_ARGS_true
+#endif
 
 #undef TARGET_MODE_EMIT
 #define TARGET_MODE_EMIT aarch64_mode_emit
