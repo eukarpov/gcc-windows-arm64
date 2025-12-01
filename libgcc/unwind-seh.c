@@ -227,7 +227,7 @@ _GCC_specific_handler (PEXCEPTION_RECORD ms_exc, void *this_frame,
       if (ms_exc->ExceptionInformation[1] == (_Unwind_Ptr) this_frame)
 	{
 	  RtlUnwindEx (this_frame, (PVOID) ms_exc->ExceptionInformation[2],
-		       ms_exc, gcc_exc, ms_orig_context,
+		       ms_exc, gcc_exc, ms_disp->ContextRecord,
 		       ms_disp->HistoryTable);
 	  abort ();
 	}
@@ -323,7 +323,7 @@ _GCC_specific_handler (PEXCEPTION_RECORD ms_exc, void *this_frame,
 
 	  /* Begin phase 2.  Perform the unwinding.  */
 	  RtlUnwindEx (this_frame, (PVOID)gcc_context.ra, ms_exc,
-		       (PVOID)gcc_context.reg[0], ms_orig_context,
+		       (PVOID)gcc_context.reg[0], ms_disp->ContextRecord,
 		       ms_disp->HistoryTable);
 	}
 
