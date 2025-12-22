@@ -31,6 +31,8 @@ along with GCC; see the file COPYING3.  If not see
 #undef  STATIC_CHAIN_REGNUM
 #define STATIC_CHAIN_REGNUM R17_REGNUM
 
+#define __NO_BINARY80__
+
 #define ASM_COMMENT_START "//"
 
 /* ASM_OUTPUT_TYPE_DIRECTIVE is not yet supported by binutils for the
